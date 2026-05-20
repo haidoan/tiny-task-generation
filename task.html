@@ -1,0 +1,976 @@
+<!DOCTYPE html>
+<!--
+  TASK QUICK-ADD TOOL — single-file browser app for capturing tasks.
+
+  Open this file in a Chromium-based browser (Chrome/Edge/Arc/Brave — needs
+  the File System Access API). On first load, pick (or create) a `task.md`
+  file; the handle is remembered in IndexedDB so the same file reopens next
+  time. Press `N` to add, `J`/`K` to move, `Enter` to edit, `D` to toggle
+  done, `X` to delete. Edits auto-save back to the Markdown file.
+
+  The data file (`task.md`) is the source of truth and carries its own
+  header documenting the line format for LLMs — see the top of that file.
+-->
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Tasks</title>
+  <style>
+    *,
+    *::before,
+    *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #f8f9fa;
+      color: #1a202c;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    /* ── Quick-add bar ── */
+    #add-bar {
+      background: #fff;
+      border-bottom: 1px solid #e2e8f0;
+      /* Horizontal padding matches #card-list so the input lines up with cards. */
+      padding: 10px 400px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-shrink: 0;
+    }
+
+    #add-input {
+      flex: 1;
+      border: 1px solid #e2e8f0;
+      border-radius: 7px;
+      padding: 7px 12px;
+      font-size: 14px;
+      color: #2d3748;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+
+    #add-input:focus {
+      border-color: #667eea;
+      box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.12);
+    }
+
+    #add-input::placeholder {
+      color: #a0aec0;
+    }
+
+    #file-label {
+      font-size: 11px;
+      color: #a0aec0;
+      white-space: nowrap;
+      cursor: pointer;
+      user-select: none;
+    }
+
+    #file-label:hover {
+      color: #667eea;
+    }
+
+    /* ── Card list ── */
+    #card-list {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px 400px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .card {
+      background: #fff;
+      border: 1px solid #e2e8f0;
+      border-radius: 8px;
+      padding: 10px 14px;
+      max-height: 300px;
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 10px;
+      cursor: pointer;
+      transition: border-color 0.12s, box-shadow 0.12s;
+      user-select: none;
+      overflow: hidden;
+    }
+
+    .card:hover {
+      border-color: #c3cfe2;
+    }
+
+    .card.focused {
+      border-color: #667eea;
+      box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.12);
+    }
+
+    .card.done {
+      background: #f7fafc;
+      opacity: 0.6;
+    }
+
+    .card.done .card-name {
+      text-decoration: line-through;
+      color: #a0aec0;
+    }
+
+    .card-body {
+      flex: 1;
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }
+
+    .card-name {
+      font-weight: 600;
+      font-size: 14px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .card-desc {
+      font-size: 12px;
+      color: #718096;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+      line-height: 1.5;
+    }
+
+    .card.done .card-desc {
+      color: #cbd5e0;
+    }
+
+    .badge {
+      flex-shrink: 0;
+      font-size: 10px;
+      font-weight: 600;
+      padding: 2px 9px;
+      border-radius: 10px;
+      letter-spacing: 0.5px;
+    }
+
+    .badge-todo {
+      background: #e2e8f0;
+      color: #4a5568;
+    }
+
+    .badge-inprogress {
+      background: #feebc8;
+      color: #9c4221;
+    }
+
+    .badge-done {
+      background: #c6f6d5;
+      color: #276749;
+    }
+
+    .card.inprogress {
+      border-left: 3px solid #ed8936;
+    }
+
+    /* ── Shortcut bar ── */
+    #shortcut-bar {
+      background: #fff;
+      border-top: 1px solid #e2e8f0;
+      padding: 6px 16px;
+      display: flex;
+      gap: 14px;
+      flex-shrink: 0;
+      flex-wrap: wrap;
+    }
+
+    .sc {
+      font-size: 11px;
+      color: #a0aec0;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    kbd {
+      background: #f7fafc;
+      border: 1px solid #e2e8f0;
+      border-radius: 3px;
+      padding: 1px 5px;
+      font-size: 10px;
+      font-family: inherit;
+    }
+
+    /* ── Bootstrap overlay ── */
+    #bootstrap {
+      position: fixed;
+      inset: 0;
+      background: rgba(248, 249, 250, 0.97);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      z-index: 100;
+    }
+
+    #bootstrap h2 {
+      font-size: 18px;
+      color: #2d3748;
+    }
+
+    #bootstrap p {
+      font-size: 13px;
+      color: #718096;
+    }
+
+    #bootstrap button {
+      margin-top: 8px;
+      background: #667eea;
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      padding: 10px 24px;
+      font-size: 14px;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+
+    #bootstrap button:hover {
+      background: #5a67d8;
+    }
+
+    /* ── Modal ── */
+    #modal-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.25);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 50;
+    }
+
+    #modal-overlay.open {
+      display: flex;
+    }
+
+    #modal {
+      background: #fff;
+      border-radius: 12px;
+      padding: 24px;
+      width: 900px;
+      max-width: 94vw;
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.15);
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    #modal-header {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+    }
+
+    #modal-name {
+      flex: 1;
+      border: none;
+      border-bottom: 2px solid #667eea;
+      outline: none;
+      font-size: 17px;
+      font-weight: 700;
+      color: #1a202c;
+      padding-bottom: 4px;
+      background: transparent;
+    }
+
+    #modal-status-btn {
+      flex-shrink: 0;
+      border: 1px solid #e2e8f0;
+      border-radius: 6px;
+      padding: 5px 12px;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      background: #f7fafc;
+      color: #4a5568;
+      transition: background 0.12s;
+    }
+
+    #modal-status-btn:hover {
+      background: #edf2f7;
+    }
+
+    #modal textarea {
+      border: 1px solid #e2e8f0;
+      border-radius: 7px;
+      padding: 8px 10px;
+      font-size: 13px;
+      color: #4a5568;
+      resize: none;
+      font-family: inherit;
+      outline: none;
+      transition: border-color 0.12s;
+    }
+
+    #modal textarea:focus {
+      border-color: #667eea;
+    }
+
+    #modal textarea::placeholder {
+      color: #cbd5e0;
+    }
+
+    #modal-desc {
+      height: 140px;
+    }
+
+    #modal-notes {
+      height: 220px;
+    }
+
+    #modal-footer {
+      display: flex;
+      justify-content: flex-end;
+      align-items: center;
+      gap: 8px;
+    }
+
+    #modal-footer .hint {
+      font-size: 11px;
+      color: #a0aec0;
+      margin-right: auto;
+    }
+
+    .btn-secondary {
+      background: #edf2f7;
+      color: #718096;
+      border: none;
+      border-radius: 6px;
+      padding: 6px 14px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+
+    .btn-primary {
+      background: #667eea;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      padding: 6px 14px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+
+    .btn-primary:hover {
+      background: #5a67d8;
+    }
+
+    /* ── Empty state ── */
+    #empty {
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      flex: 1;
+      gap: 6px;
+      color: #a0aec0;
+      font-size: 14px;
+    }
+
+    #empty span {
+      font-size: 32px;
+    }
+  </style>
+</head>
+
+<body>
+
+  <!-- Bootstrap overlay -->
+  <div id="bootstrap">
+    <h2>Task Manager</h2>
+    <p>Pick your <code>task.md</code> file to get started (or create a new one).</p>
+    <button id="open-file-btn">Open task.md</button>
+  </div>
+
+  <!-- Quick-add bar -->
+  <div id="add-bar">
+    <input id="add-input" type="text" placeholder="New task… (press N to focus, Enter to add)" autocomplete="off" title="N — focus this input&#10;Enter — add the typed task&#10;Esc — cancel">
+    <span id="file-label" title="Click to change file">no file</span>
+  </div>
+
+  <!-- Card list -->
+  <div id="card-list">
+    <div id="empty">
+      <span>✓</span>
+      <div>No tasks yet — press <kbd>N</kbd> to add one</div>
+    </div>
+  </div>
+
+  <!-- Shortcut bar -->
+  <div id="shortcut-bar">
+    <span class="sc"><kbd>N</kbd> new task</span>
+    <span class="sc"><kbd>J</kbd><kbd>K</kbd> move</span>
+    <span class="sc"><kbd>Enter</kbd> view task</span>
+    <span class="sc"><kbd>Space</kbd> toggle status</span>
+    <span class="sc"><kbd>Backspace</kbd> remove task</span>
+    <span class="sc"><kbd>Esc</kbd> cancel</span>
+  </div>
+
+  <!-- Modal -->
+  <div id="modal-overlay">
+    <div id="modal">
+      <div id="modal-header">
+        <input id="modal-name" type="text" placeholder="Task name">
+        <button id="modal-status-btn">TODO</button>
+      </div>
+      <textarea id="modal-desc" placeholder="Description…"></textarea>
+      <textarea id="modal-notes" placeholder="Metadata…"></textarea>
+      <div id="modal-footer">
+        <span class="hint">Tab — next field &nbsp; ⌘Enter — save &nbsp; Esc — close</span>
+        <button class="btn-secondary" id="modal-cancel-btn">Cancel</button>
+        <button class="btn-primary" id="modal-save-btn">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // ── State ────────────────────────────────────────────────────────────────────
+    let tasks = [];        // [{id, name, description, notes, status}]
+    let focusedIdx = 0;
+    let fileHandle = null;
+    let modalTaskId = null;
+    let modalStatus = 'todo';
+
+    // ── IndexedDB ─────────────────────────────────────────────────────────────────
+    const DB_NAME = 'tasks-app', DB_STORE = 'handles', DB_KEY = 'task-md';
+
+    function openDB() {
+      return new Promise((res, rej) => {
+        const req = indexedDB.open(DB_NAME, 1);
+        req.onupgradeneeded = e => e.target.result.createObjectStore(DB_STORE);
+        req.onsuccess = e => res(e.target.result);
+        req.onerror = e => rej(e);
+      });
+    }
+
+    async function saveHandle(h) {
+      const db = await openDB();
+      return new Promise((res, rej) => {
+        const tx = db.transaction(DB_STORE, 'readwrite');
+        tx.objectStore(DB_STORE).put(h, DB_KEY);
+        tx.oncomplete = res;
+        tx.onerror = rej;
+      });
+    }
+
+    async function loadHandle() {
+      const db = await openDB();
+      return new Promise((res, rej) => {
+        const tx = db.transaction(DB_STORE, 'readonly');
+        const req = tx.objectStore(DB_STORE).get(DB_KEY);
+        req.onsuccess = e => res(e.target.result || null);
+        req.onerror = rej;
+      });
+    }
+
+    // ── task.md parser / serializer ───────────────────────────────────────────────
+    // Storage format: YAML stanzas separated by `---`. Two older formats
+    // (`## H2` Markdown and single-line `- [ ] name || desc || meta`) are
+    // auto-detected and migrated on first load.
+    function parse(text) {
+      const stripped = text.replace(/<!--[\s\S]*?-->/g, '');
+      if (/^name:\s/m.test(stripped) && /^status:\s/m.test(stripped)) return parseYaml(stripped);
+      if (/^##\s+/m.test(stripped)) return parseH2(stripped);
+      return parseLegacyPipe(stripped);
+    }
+
+    function parseYaml(stripped) {
+      const stanzas = stripped.split(/^\s*---\s*$/m);
+      const tasks = [];
+      for (const stanza of stanzas) {
+        const lines = stanza.split('\n');
+        const fields = { name: '', status: 'todo', description: '', notes: '' };
+        let i = 0;
+        while (i < lines.length) {
+          const m = lines[i].match(/^(name|status|description|metadata):\s*(.*)$/);
+          if (!m) { i++; continue; }
+          const key = m[1];
+          let value = m[2];
+          if (value === '|') {
+            const block = [];
+            i++;
+            while (i < lines.length && (lines[i].startsWith('  ') || lines[i] === '')) {
+              block.push(lines[i].startsWith('  ') ? lines[i].slice(2) : lines[i]);
+              i++;
+            }
+            while (block.length && block[block.length - 1] === '') block.pop();
+            value = block.join('\n');
+          } else {
+            if (value.startsWith("'") && value.endsWith("'") && value.length >= 2) {
+              value = value.slice(1, -1).replace(/''/g, "'");
+            }
+            i++;
+          }
+          if (key === 'metadata') fields.notes = value;
+          else if (key === 'status') fields.status = (value === 'done' || value === 'inprogress') ? value : 'todo';
+          else fields[key] = value;
+        }
+        if (fields.name) tasks.push({ id: crypto.randomUUID(), ...fields });
+      }
+      return tasks;
+    }
+
+    function parseLegacyPipe(stripped) {
+      return stripped.split('\n')
+        .map(l => l.trim())
+        .filter(l => /^- \[[ xX/]\] /.test(l))
+        .map(l => {
+          let status = 'todo';
+          if (l.startsWith('- [x]') || l.startsWith('- [X]')) status = 'done';
+          else if (l.startsWith('- [/]')) status = 'inprogress';
+          const rest = l.replace(/^- \[[ xX/]\] /, '');
+          const [name = '', description = '', notes = ''] = rest.split(/\s*\|\|\s*/);
+          return { id: crypto.randomUUID(), name: name.trim(), description: description.trim(), notes: notes.trim(), status };
+        })
+        .filter(t => t.name);
+    }
+
+    function parseH2(stripped) {
+      const lines = stripped.split('\n');
+      const tasks = [];
+      let cur = null;
+      let curField = null;
+      let buf = [];
+
+      function flushField() {
+        if (!cur || !curField) { curField = null; buf = []; return; }
+        const content = buf.map(l => l.startsWith('  ') ? l.slice(2) : l).join('\n').trim();
+        if (curField === 'description') cur.description = content;
+        else if (curField === 'metadata') cur.notes = content;
+        curField = null;
+        buf = [];
+      }
+
+      for (const raw of lines) {
+        const heading = raw.match(/^##\s+(.+?)\s*$/);
+        if (heading) {
+          flushField();
+          if (cur) tasks.push(cur);
+          cur = { id: crypto.randomUUID(), name: heading[1].trim(), description: '', notes: '', status: 'todo' };
+          continue;
+        }
+        if (!cur) continue;
+
+        const field = raw.match(/^- \*\*(Status|Description|Metadata):\*\*\s*(.*)$/);
+        if (field) {
+          flushField();
+          const which = field[1].toLowerCase();
+          const inline = field[2];
+          if (which === 'status') {
+            const m = inline.match(/\[([ xX/])\]/);
+            if (m) {
+              const c = m[1];
+              cur.status = (c === 'x' || c === 'X') ? 'done' : c === '/' ? 'inprogress' : 'todo';
+            }
+          } else {
+            curField = which;
+            if (inline.trim()) buf.push(inline);
+          }
+          continue;
+        }
+
+        if (curField) buf.push(raw);
+      }
+      flushField();
+      if (cur) tasks.push(cur);
+      return tasks.filter(t => t.name);
+    }
+
+    const TASK_FILE_HEADER = [
+      '<!--',
+      '  task.md — managed by task.html quick-add tool.',
+      '  LLM instructions:',
+      '    - Work ONLY on tasks where `status: inprogress`.',
+      '    - Skip tasks with `status: todo` (not started) or `status: done`.',
+      '    - When you finish a task, change its `status:` from `inprogress` to',
+      '      `done` in this file. Leave the rest of the stanza unchanged.',
+      '    - The user refers to tasks by their `index:` (e.g. "work on task 3" =',
+      '      the stanza with `index: 3`). Indices are positional (1..N, top-down)',
+      '      and renumber whenever tasks are added/removed/reordered.',
+      '    - Each task is a YAML stanza separated by `---`. Fields:',
+      '        index:        1-based position. Authoritative reference for the user.',
+      '        name:         single-line task title',
+      '        status:       one of: todo | inprogress | done',
+      '        description:  free-form text. May be empty, single-line, or a `|` block.',
+      '        metadata:     free-form text. May be empty, single-line, or a `|` block.',
+      '    - For multi-line values the `|` block scalar is used and content is',
+      '      indented by 2 spaces. Content inside `|` is preserved verbatim,',
+      '      including code fences and nested lists.',
+      '    - Anything outside a stanza (and not inside this HTML comment) is commentary.',
+      '-->',
+      '',
+      '',
+    ].join('\n');
+
+    // STATUS_TO_CHECK is no longer used by the YAML serializer (status is written
+    // as a word). Kept in case future code needs the symbol form.
+    const STATUS_TO_CHECK = { todo: '[ ]', inprogress: '[/]', done: '[x]' };
+
+    function yamlInline(s) {
+      if (/^[A-Za-z0-9 _.\-+@()/]+$/.test(s) && !/^[-?:,\[\]{}#&*!|>'"%@`]/.test(s.trim())) {
+        return s;
+      }
+      return `'${s.replace(/'/g, "''")}'`;
+    }
+
+    function emitBlock(key, value) {
+      if (!value) return `${key}:`;
+      const indented = value.split('\n').map(l => '  ' + l).join('\n');
+      return `${key}: |\n${indented}`;
+    }
+
+    function serialize(tasks) {
+      const body = tasks.map((t, i) => {
+        const lines = [
+          `index: ${i + 1}`,
+          `name: ${yamlInline(t.name)}`,
+          `status: ${t.status}`,
+          emitBlock('description', t.description),
+          emitBlock('metadata', t.notes),
+        ];
+        return lines.join('\n');
+      }).join('\n\n---\n\n');
+      return TASK_FILE_HEADER + body + (tasks.length ? '\n' : '');
+    }
+
+    function cycleStatus(s) {
+      return s === 'todo' ? 'inprogress' : s === 'inprogress' ? 'done' : 'todo';
+    }
+
+    // ── File I/O ──────────────────────────────────────────────────────────────────
+    async function readFile(h) {
+      const file = await h.getFile();
+      return file.text();
+    }
+
+    async function writeFile(h, content) {
+      const writable = await h.createWritable();
+      await writable.write(content);
+      await writable.close();
+    }
+
+    async function saveAll() {
+      if (!fileHandle) return;
+      await writeFile(fileHandle, serialize(tasks));
+    }
+
+    // ── Render ────────────────────────────────────────────────────────────────────
+    function render() {
+      const list = document.getElementById('card-list');
+      const empty = document.getElementById('empty');
+
+      // Remove old cards
+      list.querySelectorAll('.card').forEach(c => c.remove());
+
+      if (!tasks.length) {
+        empty.style.display = 'flex';
+        return;
+      }
+      empty.style.display = 'none';
+
+      const STATUS_LABEL = { todo: 'TODO', inprogress: 'IN PROGRESS', done: 'DONE' };
+      const STATUS_CLASS = { todo: 'badge-todo', inprogress: 'badge-inprogress', done: 'badge-done' };
+
+      tasks.forEach((t, i) => {
+        const card = document.createElement('div');
+        const statusClass = t.status === 'done' ? ' done' : t.status === 'inprogress' ? ' inprogress' : '';
+        card.className = 'card' + statusClass + (i === focusedIdx ? ' focused' : '');
+        card.dataset.idx = i;
+        const previewDesc = t.description.replace(/```[a-z]*\n?/gi, '').replace(/\s+/g, ' ').trim();
+        card.title = 'Enter — view\nSpace — toggle status\nBackspace — remove\nJ/K — move focus';
+        card.innerHTML = `
+          <div class="card-body">
+            <div class="card-name"><span style="color:#a0aec0;font-weight:500;margin-right:6px;">${i + 1}.</span>${esc(t.name)}</div>
+            ${previewDesc ? `<div class="card-desc">${esc(previewDesc)}</div>` : ''}
+          </div>
+          <span class="badge ${STATUS_CLASS[t.status]}">${STATUS_LABEL[t.status]}</span>
+        `;
+        card.addEventListener('click', () => { focusedIdx = i; render(); openModal(i); });
+        list.appendChild(card);
+      });
+
+      // Scroll focused card into view
+      const focused = list.querySelector('.card.focused');
+      if (focused) focused.scrollIntoView({ block: 'nearest' });
+    }
+
+    function esc(s) {
+      return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    // ── Modal ─────────────────────────────────────────────────────────────────────
+    function openModal(idx) {
+      const t = tasks[idx];
+      modalTaskId = t.id;
+      modalStatus = t.status;
+
+      document.getElementById('modal-name').value = t.name;
+      document.getElementById('modal-desc').value = t.description;
+      document.getElementById('modal-notes').value = t.notes;
+      updateModalStatusBtn();
+
+      document.getElementById('modal-overlay').classList.add('open');
+      document.getElementById('modal-name').focus();
+    }
+
+    function closeModal() {
+      document.getElementById('modal-overlay').classList.remove('open');
+      modalTaskId = null;
+    }
+
+    function updateModalStatusBtn() {
+      const btn = document.getElementById('modal-status-btn');
+      if (modalStatus === 'done') {
+        btn.textContent = 'DONE';
+        btn.style.background = '#c6f6d5';
+        btn.style.color = '#276749';
+        btn.style.borderColor = '#9ae6b4';
+      } else if (modalStatus === 'inprogress') {
+        btn.textContent = 'IN PROGRESS';
+        btn.style.background = '#feebc8';
+        btn.style.color = '#9c4221';
+        btn.style.borderColor = '#fbd38d';
+      } else {
+        btn.textContent = 'TODO';
+        btn.style.background = '#f7fafc';
+        btn.style.color = '#4a5568';
+        btn.style.borderColor = '#e2e8f0';
+      }
+    }
+
+    function saveModal() {
+      if (!modalTaskId) return;
+      const idx = tasks.findIndex(t => t.id === modalTaskId);
+      if (idx === -1) return;
+      tasks[idx].name = document.getElementById('modal-name').value.trim() || tasks[idx].name;
+      tasks[idx].description = document.getElementById('modal-desc').value.trim();
+      tasks[idx].notes = document.getElementById('modal-notes').value.trim();
+      tasks[idx].status = modalStatus;
+      closeModal();
+      render();
+      saveAll();
+    }
+
+    // ── Modal status toggle ───────────────────────────────────────────────────────
+    // ── Auto-save from modal ──────────────────────────────────────────────────────
+    let autoSaveTimer = null;
+
+    function autoSaveModal() {
+      if (!modalTaskId) return;
+      const idx = tasks.findIndex(t => t.id === modalTaskId);
+      if (idx === -1) return;
+      const name = document.getElementById('modal-name').value.trim();
+      if (name) tasks[idx].name = name;
+      tasks[idx].description = document.getElementById('modal-desc').value.trim();
+      tasks[idx].notes = document.getElementById('modal-notes').value.trim();
+      tasks[idx].status = modalStatus;
+      render();
+      saveAll();
+    }
+
+    function scheduleAutoSave() {
+      clearTimeout(autoSaveTimer);
+      autoSaveTimer = setTimeout(autoSaveModal, 600);
+    }
+
+    ['modal-name', 'modal-desc', 'modal-notes'].forEach(id => {
+      document.getElementById(id).addEventListener('input', scheduleAutoSave);
+    });
+
+    document.getElementById('modal-status-btn').addEventListener('click', () => {
+      modalStatus = cycleStatus(modalStatus);
+      updateModalStatusBtn();
+      autoSaveModal();
+    });
+
+    document.getElementById('modal-save-btn').addEventListener('click', saveModal);
+    document.getElementById('modal-cancel-btn').addEventListener('click', closeModal);
+
+    document.getElementById('modal-overlay').addEventListener('click', e => {
+      if (e.target === document.getElementById('modal-overlay')) closeModal();
+    });
+
+    // ── Keyboard ──────────────────────────────────────────────────────────────────
+    document.addEventListener('keydown', e => {
+      const modalOpen = document.getElementById('modal-overlay').classList.contains('open');
+      const addFocused = document.activeElement === document.getElementById('add-input');
+
+      // ── Modal context ──
+      if (modalOpen) {
+        if (e.key === 'Escape') { e.preventDefault(); closeModal(); return; }
+        if (e.key === 'Enter' && e.metaKey) { e.preventDefault(); saveModal(); return; }
+        if (e.key === 'Enter' && !e.shiftKey && document.activeElement.tagName !== 'TEXTAREA') {
+          e.preventDefault(); saveModal(); return;
+        }
+        if (e.key === ' ') {
+          // Only cycle if not in a text field (space is a literal char there)
+          if (document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA') return;
+          e.preventDefault();
+          modalStatus = cycleStatus(modalStatus);
+          updateModalStatusBtn();
+          autoSaveModal();
+        }
+        return;
+      }
+
+      // ── Quick-add input context ──
+      if (addFocused) {
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          document.getElementById('add-input').value = '';
+          document.getElementById('add-input').blur();
+        }
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          const name = document.getElementById('add-input').value.trim();
+          if (name) {
+            tasks.push({ id: crypto.randomUUID(), name, description: '', notes: '', status: 'todo' });
+            focusedIdx = tasks.length - 1;
+            document.getElementById('add-input').value = '';
+            document.getElementById('add-input').blur();
+            render();
+            saveAll();
+          }
+        }
+        return;
+      }
+
+      // ── List context ──
+      switch (e.key) {
+        case 'n':
+        case 'N':
+          e.preventDefault();
+          document.getElementById('add-input').focus();
+          break;
+        case 'j':
+        case 'J':
+        case 'ArrowDown':
+          e.preventDefault();
+          if (tasks.length) { focusedIdx = Math.min(focusedIdx + 1, tasks.length - 1); render(); }
+          break;
+        case 'k':
+        case 'K':
+        case 'ArrowUp':
+          e.preventDefault();
+          if (tasks.length) { focusedIdx = Math.max(focusedIdx - 1, 0); render(); }
+          break;
+        case 'Enter':
+          e.preventDefault();
+          if (tasks.length) openModal(focusedIdx);
+          break;
+        case ' ':
+          e.preventDefault();
+          if (tasks.length) {
+            tasks[focusedIdx].status = cycleStatus(tasks[focusedIdx].status);
+            render();
+            saveAll();
+          }
+          break;
+        case 'Backspace':
+          e.preventDefault();
+          if (tasks.length) {
+            const t = tasks[focusedIdx];
+            if (!confirm(`Remove task "${t.name}"?`)) break;
+            tasks.splice(focusedIdx, 1);
+            focusedIdx = Math.min(focusedIdx, tasks.length - 1);
+            render();
+            saveAll();
+          }
+          break;
+      }
+    });
+
+    // ── Tab cycling inside modal ──────────────────────────────────────────────────
+    document.getElementById('modal').addEventListener('keydown', e => {
+      if (e.key !== 'Tab') return;
+      const fields = [
+        document.getElementById('modal-name'),
+        document.getElementById('modal-desc'),
+        document.getElementById('modal-notes'),
+        document.getElementById('modal-status-btn'),
+      ];
+      const cur = fields.indexOf(document.activeElement);
+      if (cur === -1) return;
+      e.preventDefault();
+      const next = e.shiftKey ? (cur - 1 + fields.length) % fields.length : (cur + 1) % fields.length;
+      fields[next].focus();
+    });
+
+    // ── Bootstrap / file open ────────────────────────────────────────────────────
+    async function openFileAndLoad() {
+      try {
+        [fileHandle] = await window.showOpenFilePicker({
+          types: [{ description: 'Markdown', accept: { 'text/markdown': ['.md'] } }],
+          multiple: false,
+        });
+      } catch {
+        return; // user cancelled
+      }
+      await saveHandle(fileHandle);
+      await loadAndRender();
+      document.getElementById('bootstrap').style.display = 'none';
+    }
+
+    async function loadAndRender() {
+      if (!fileHandle) return;
+      const text = await readFile(fileHandle);
+      tasks = parse(text);
+      focusedIdx = 0;
+      const name = (await fileHandle.getFile()).name;
+      document.getElementById('file-label').textContent = name;
+      render();
+    }
+
+    document.getElementById('open-file-btn').addEventListener('click', openFileAndLoad);
+    document.getElementById('file-label').addEventListener('click', openFileAndLoad);
+
+    // ── Init ──────────────────────────────────────────────────────────────────────
+    (async () => {
+      const h = await loadHandle().catch(() => null);
+      if (!h) return; // show bootstrap overlay
+
+      // Try to re-use stored handle
+      try {
+        const perm = await h.queryPermission({ mode: 'readwrite' });
+        if (perm === 'granted') {
+          fileHandle = h;
+          await loadAndRender();
+          document.getElementById('bootstrap').style.display = 'none';
+          return;
+        }
+        const req = await h.requestPermission({ mode: 'readwrite' });
+        if (req === 'granted') {
+          fileHandle = h;
+          await loadAndRender();
+          document.getElementById('bootstrap').style.display = 'none';
+        }
+      } catch {
+        // Fall through to bootstrap overlay
+      }
+    })();
+  </script>
+</body>
+
+</html>
